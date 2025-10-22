@@ -1,12 +1,12 @@
 package org.example;
 
+import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
-import java.time.Duration;
-import java.util.Objects;
 
 public class Main {
     public static void main(String[] args) {
@@ -18,6 +18,12 @@ public class Main {
         // - MYSQL_DB (default: mysql)
         // - MYSQL_USER (default: root)
         // - MYSQL_PASSWORD (default: empty)
+        // - MYSQL_CONNECT_TIMEOUT_MS (default: 5000)
+        // - MYSQL_SOCKET_TIMEOUT_MS (default: 10000)
+        // - MYSQL_RETRIES (default: 5)
+        // - MYSQL_RETRY_DELAY_MS (default: 1000)
+        // - MYSQL_WAIT_FOR_HOST (default: false)
+        // - MYSQL_WAIT_TIMEOUT_MS (default: 30000)
 
         String jdbcUrl = System.getenv("MYSQL_URL");
         String host = getEnvOrDefault("MYSQL_HOST", "localhost");
@@ -33,18 +39,30 @@ public class Main {
                     host, port, database);
         }
 
-        // Optional: allow overriding connect timeout via env (ms)
+        // Optional: timeouts via env (ms)
         int connectTimeoutMs = parseIntOrDefault(System.getenv("MYSQL_CONNECT_TIMEOUT_MS"), 5000);
+        int socketTimeoutMs = parseIntOrDefault(System.getenv("MYSQL_SOCKET_TIMEOUT_MS"), 10000);
 
-        // The MySQL driver will pick up connectTimeout from the URL; append if not present
-        if (!jdbcUrl.contains("connectTimeout=")) {
+        // Append timeouts if not present in URL
+        if (!jdbcUrl.toLowerCase().contains("connecttimeout=")) {
             String sep = jdbcUrl.contains("?") ? "&" : "?";
             jdbcUrl = jdbcUrl + sep + "connectTimeout=" + connectTimeoutMs;
         }
+        if (!jdbcUrl.toLowerCase().contains("sockettimeout=")) {
+            String sep2 = jdbcUrl.contains("?") ? "&" : "?";
+            jdbcUrl = jdbcUrl + sep2 + "socketTimeout=" + socketTimeoutMs;
+        }
+
+        int retries = parseIntOrDefault(System.getenv("MYSQL_RETRIES"), 5);
+        int delayMs = parseIntOrDefault(System.getenv("MYSQL_RETRY_DELAY_MS"), 1000);
+        boolean waitForHost = "true".equalsIgnoreCase(getEnvOrDefault("MYSQL_WAIT_FOR_HOST", "false"));
+        int waitTimeoutMs = parseIntOrDefault(System.getenv("MYSQL_WAIT_TIMEOUT_MS"), 30000);
 
         System.out.println("[INFO] Attempting MySQL connection...");
         System.out.println("[INFO] JDBC URL: " + redactPassword(jdbcUrl));
         System.out.println("[INFO] User: " + user);
+        System.out.println("[INFO] Host: " + host + ":" + port);
+        System.out.println("[INFO] connectTimeoutMs=" + connectTimeoutMs + ", socketTimeoutMs=" + socketTimeoutMs);
 
         // Load driver explicitly (often optional, but safe across environments)
         try {
@@ -55,53 +73,92 @@ public class Main {
             System.exit(2);
         }
 
-        try (Connection conn = DriverManager.getConnection(jdbcUrl, user, password)) {
-            System.out.println("[INFO] Connection established successfully.");
-
-            // Health check query (configurable via env MYSQL_HEALTHCHECK_QUERY; default SELECT 1)
-            String healthQuery = getEnvOrDefault("MYSQL_HEALTHCHECK_QUERY", "SELECT 1");
-            String expectedRaw = System.getenv("MYSQL_HEALTHCHECK_EXPECT");
-            System.out.println("[INFO] Running health check query: " + healthQuery);
-            try (Statement st = conn.createStatement()) {
-                try (ResultSet rs = st.executeQuery(healthQuery)) {
-                    if (rs.next()) {
-                        String firstCol = null;
-                        try {
-                            firstCol = rs.getString(1);
-                        } catch (Exception ignore) {}
-                        System.out.println("[INFO] Health check first column: " + firstCol);
-                        boolean pass;
-                        if (expectedRaw != null && !expectedRaw.isBlank()) {
-                            pass = valuesMatch(firstCol, expectedRaw);
-                        } else if ("select 1".equalsIgnoreCase(healthQuery.trim())) {
-                            // Backward-compatible default
-                            int result = rs.getInt(1);
-                            pass = (result == 1);
-                            if (!pass) {
-                                System.err.println("[WARN] Unexpected health check result: " + result);
-                            }
-                        } else {
-                            // If no expected provided, any row means success
-                            pass = true;
-                        }
-                        if (pass) {
-                            System.out.println("[INFO] MySQL health check passed.");
-                            System.exit(0);
-                        } else {
-                            System.err.println("[WARN] MySQL health check failed based on expectation.");
-                            System.exit(3);
-                        }
-                    } else {
-                        System.err.println("[WARN] Health check returned no rows.");
-                        System.exit(3);
-                    }
+        // Optional preflight: wait for host:port to accept TCP
+        if (waitForHost) {
+            System.out.println("[INFO] Waiting for MySQL host:port to become available (timeout " + waitTimeoutMs + " ms)...");
+            long deadline = System.currentTimeMillis() + waitTimeoutMs;
+            boolean ok = false;
+            while (System.currentTimeMillis() < deadline) {
+                try (Socket s = new Socket()) {
+                    s.connect(new InetSocketAddress(host, Integer.parseInt(port)), Math.min(2000, connectTimeoutMs));
+                    ok = true;
+                    break;
+                } catch (Exception ignored) {
+                    try { Thread.sleep(250); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
                 }
             }
-        } catch (SQLException e) {
-            System.err.println("[ERROR] Failed to connect or query MySQL.");
-            printSqlException(e);
-            System.exit(1);
+            if (!ok) {
+                System.err.println("[WARN] MySQL host:port didn't become available within wait timeout; continuing to JDBC attempts.");
+            } else {
+                System.out.println("[INFO] Host:port is reachable, proceeding with JDBC.");
+            }
         }
+
+        // Retry loop for connection and health check
+        SQLException lastSqlException = null;
+        for (int attempt = 1; attempt <= Math.max(1, retries); attempt++) {
+            if (attempt > 1) {
+                System.out.println("[INFO] Retry attempt " + attempt + " of " + retries + "...");
+            }
+            try (Connection conn = DriverManager.getConnection(jdbcUrl, user, password)) {
+                System.out.println("[INFO] Connection established successfully.");
+
+                // Health check query (configurable via env MYSQL_HEALTHCHECK_QUERY; default SELECT 1)
+                String healthQuery = getEnvOrDefault("MYSQL_HEALTHCHECK_QUERY", "SELECT 1");
+                String expectedRaw = System.getenv("MYSQL_HEALTHCHECK_EXPECT");
+                System.out.println("[INFO] Running health check query: " + healthQuery);
+                try (Statement st = conn.createStatement()) {
+                    try (ResultSet rs = st.executeQuery(healthQuery)) {
+                        if (rs.next()) {
+                            String firstCol = null;
+                            try {
+                                firstCol = rs.getString(1);
+                            } catch (Exception ignore) {}
+                            System.out.println("[INFO] Health check first column: " + firstCol);
+                            boolean pass;
+                            if (expectedRaw != null && !expectedRaw.isBlank()) {
+                                pass = valuesMatch(firstCol, expectedRaw);
+                            } else if ("select 1".equalsIgnoreCase(healthQuery.trim())) {
+                                // Backward-compatible default
+                                int result = rs.getInt(1);
+                                pass = (result == 1);
+                                if (!pass) {
+                                    System.err.println("[WARN] Unexpected health check result: " + result);
+                                }
+                            } else {
+                                // If no expected provided, any row means success
+                                pass = true;
+                            }
+                            if (pass) {
+                                System.out.println("[INFO] MySQL health check passed.");
+                                System.exit(0);
+                            } else {
+                                System.err.println("[WARN] MySQL health check failed based on expectation.");
+                                System.exit(3);
+                            }
+                        } else {
+                            System.err.println("[WARN] Health check returned no rows.");
+                            System.exit(3);
+                        }
+                    }
+                }
+            } catch (SQLException e) {
+                lastSqlException = e;
+                System.err.println("[ERROR] Attempt " + attempt + " failed to connect or query MySQL.");
+                printSqlException(e);
+                if (attempt < Math.max(1, retries)) {
+                    try { Thread.sleep(delayMs); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+                    continue;
+                }
+            }
+        }
+
+        System.err.println("[ERROR] All attempts to connect/query MySQL have failed.");
+        System.err.println("[HINT] Check that the MySQL server is running and reachable at " + host + ":" + port + ", credentials are correct, and that firewalls or Docker networking allow access. If needed, provide a full MYSQL_URL.");
+        if (lastSqlException != null) {
+            printSqlException(lastSqlException);
+        }
+        System.exit(1);
     }
 
     private static String getEnvOrDefault(String key, String def) {
