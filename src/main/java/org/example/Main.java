@@ -58,17 +58,37 @@ public class Main {
         try (Connection conn = DriverManager.getConnection(jdbcUrl, user, password)) {
             System.out.println("[INFO] Connection established successfully.");
 
-            // Simple health check: SELECT 1
+            // Health check query (configurable via env MYSQL_HEALTHCHECK_QUERY; default SELECT 1)
+            String healthQuery = getEnvOrDefault("MYSQL_HEALTHCHECK_QUERY", "SELECT 1");
+            String expectedRaw = System.getenv("MYSQL_HEALTHCHECK_EXPECT");
+            System.out.println("[INFO] Running health check query: " + healthQuery);
             try (Statement st = conn.createStatement()) {
-                try (ResultSet rs = st.executeQuery("SELECT 1")) {
+                try (ResultSet rs = st.executeQuery(healthQuery)) {
                     if (rs.next()) {
-                        int result = rs.getInt(1);
-                        System.out.println("[INFO] Health check query result: " + result);
-                        if (result == 1) {
+                        String firstCol = null;
+                        try {
+                            firstCol = rs.getString(1);
+                        } catch (Exception ignore) {}
+                        System.out.println("[INFO] Health check first column: " + firstCol);
+                        boolean pass;
+                        if (expectedRaw != null && !expectedRaw.isBlank()) {
+                            pass = valuesMatch(firstCol, expectedRaw);
+                        } else if ("select 1".equalsIgnoreCase(healthQuery.trim())) {
+                            // Backward-compatible default
+                            int result = rs.getInt(1);
+                            pass = (result == 1);
+                            if (!pass) {
+                                System.err.println("[WARN] Unexpected health check result: " + result);
+                            }
+                        } else {
+                            // If no expected provided, any row means success
+                            pass = true;
+                        }
+                        if (pass) {
                             System.out.println("[INFO] MySQL health check passed.");
                             System.exit(0);
                         } else {
-                            System.err.println("[WARN] Unexpected health check result: " + result);
+                            System.err.println("[WARN] MySQL health check failed based on expectation.");
                             System.exit(3);
                         }
                     } else {
@@ -107,6 +127,20 @@ public class Main {
         int end = url.indexOf('&', idx);
         if (end < 0) end = url.length();
         return url.substring(0, idx + marker.length()) + "******" + url.substring(end);
+    }
+
+    private static boolean valuesMatch(String actual, String expected) {
+        if (actual == null) return false;
+        String a = actual.trim();
+        String eStr = expected == null ? "" : expected.trim();
+        if (a.equals(eStr)) return true;
+        try {
+            double da = Double.parseDouble(a);
+            double de = Double.parseDouble(eStr);
+            return Double.compare(da, de) == 0;
+        } catch (NumberFormatException ex) {
+            return false;
+        }
     }
 
     private static void printSqlException(SQLException e) {
